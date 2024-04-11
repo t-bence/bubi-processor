@@ -111,7 +111,15 @@ time_deduped = (with_timestamp
   .drop("measurement_in_ten_mins")
   .withColumn("minute", F.col("ten_minute") * 10)
   .drop("ten_minute")
+  # truncate timestamp to minutes only
+  .withColumn("timestamp", F.date_trunc("minute", F.col("timestamp")))
+  # drop first run that is not at a ten-minute interval
+  .filter(F.col("timestamp") >= "2024-03-12T11:00:00.000+00:00")
 )
+
+# COMMAND ----------
+
+display(time_deduped.orderBy("timestamp"))
 
 # COMMAND ----------
 
@@ -217,6 +225,11 @@ closest_stations = (station_distances
 # COMMAND ----------
 
 display(closest_stations)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC This is to find problems because of ties -- should not find any rows now
 
 # COMMAND ----------
 
