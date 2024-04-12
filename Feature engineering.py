@@ -75,7 +75,7 @@ bikes_with_closest_data = (bikes_at_stations
 
 # COMMAND ----------
 
-display(bikes_with_closest_data)
+#display(bikes_with_closest_data)
 
 # COMMAND ----------
 
@@ -97,6 +97,13 @@ bikes_with_closest_data.printSchema()
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC Create gold table for learning
+# MAGIC
+# MAGIC Array type is not suitable, so I will split the close_bike column. ML training works, but the KernelExplainer fails and is not able to explain feature importances when I use a vector.
+
+# COMMAND ----------
+
 from pyspark.sql.window import Window
 
 seconds_in_hours = 3600
@@ -110,61 +117,26 @@ windowSpec = (Window
 gold_table = (bikes_with_closest_data
   .withColumn("weekday", F.dayofweek("timestamp"))
   .withColumn("hour", F.hour("timestamp"))
+  .withColumn("minute", F.minute("timestamp"))
   .withColumn("future_bikes", F.mean("bikes").over(windowSpec))
+  .drop("timestamp")
+  .withColumn("close_bikes_1", F.element_at("close_bikes", 1))
+  .withColumn("close_bikes_2", F.element_at("close_bikes", 2))
+  .withColumn("close_bikes_3", F.element_at("close_bikes", 3))
+  .withColumn("close_bikes_4", F.element_at("close_bikes", 4))
+  .withColumn("close_bikes_5", F.element_at("close_bikes", 5))
+  .drop("close_bikes")
+  .filter(F.col("future_bikes").isNotNull())
+  
 )
 
 # COMMAND ----------
 
-display(gold_table.orderBy("station_id", "timestamp"))
+display(gold_table.orderBy("station_id"))
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC
-# MAGIC Save a table with the bikes at Krisztina körút station to play with AutoML
-
-# COMMAND ----------
-
-krisztina_table = (gold_table
- .filter(F.col("station_id") == 2100)
- .drop("station_id")
- .withColumn("minute", F.minute("timestamp"))
- .drop("timestamp")
-)
-
-# COMMAND ----------
-
-(krisztina_table.write
- .mode("overwrite")
- .option("overwriteSchema", "true")
- .saveAsTable("bence_toth.bubi_spark.krisztina_bikes")
- )
-
-# COMMAND ----------
-
-gold_table.count()
-
-# COMMAND ----------
-
-gold_table.filter(F.col("bikes").isNotNull()).count()
-
-# COMMAND ----------
-
-krisztina_table.printSchema()
-
-# COMMAND ----------
-
-krisztina_table.drop("future_bikes").dropDuplicates().count()
-
-# COMMAND ----------
-
-from databricks import feature_store
-
-fs = feature_store.FeatureStoreClient()
-
-fs.write_table(
-  name="bubi_bikes"
-)
+gold_table.write.mode("overwrite").saveAsTable("bence_toth.bubi_spark.gold_table")
 
 # COMMAND ----------
 
