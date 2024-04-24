@@ -16,10 +16,22 @@ volume_path = "/Volumes/bence_toth/bubi_project/bubi-scraper-v2-volume"
 
 # COMMAND ----------
 
-from pyspark.sql.types import StructType, StructField, ArrayType, BooleanType, LongType, StringType, DoubleType
+# MAGIC %md
+# MAGIC Run the Utilities notebook to get some helper functions
 
-json_schema = StructType([StructField('countries', ArrayType(StructType([StructField('available_bikes', LongType(), True), StructField('booked_bikes', LongType(), True), StructField('capped_available_bikes', BooleanType(), True), StructField('cities', ArrayType(StructType([StructField('alias', StringType(), True), StructField('available_bikes', LongType(), True), StructField('bike_types', StructType([StructField('150', LongType(), True), StructField('297', LongType(), True), StructField('undefined', LongType(), True)]), True), StructField('booked_bikes', LongType(), True), StructField('bounds', StructType([StructField('north_east', StructType([StructField('lat', DoubleType(), True), StructField('lng', DoubleType(), True)]), True), StructField('south_west', StructType([StructField('lat', DoubleType(), True), StructField('lng', DoubleType(), True)]), True)]), True), StructField('break', BooleanType(), True), StructField('lat', DoubleType(), True), StructField('lng', DoubleType(), True), StructField('maps_icon', StringType(), True), StructField('name', StringType(), True), StructField('num_places', LongType(), True), StructField('places', ArrayType(StructType([StructField('address', StringType(), True), StructField('bike', BooleanType(), True), StructField('bike_list', ArrayType(StructType([StructField('active', BooleanType(), True), StructField('battery_pack', StringType(), True), StructField('bike_type', LongType(), True), StructField('boardcomputer', LongType(), True), StructField('electric_lock', BooleanType(), True), StructField('lock_types', ArrayType(StringType(), True), True), StructField('number', StringType(), True), StructField('pedelec_battery', StringType(), True), StructField('state', StringType(), True)]), True), True), StructField('bike_numbers', ArrayType(StringType(), True), True), StructField('bike_racks', LongType(), True), StructField('bike_types', StructType([StructField('150', LongType(), True), StructField('297', LongType(), True), StructField('undefined', LongType(), True)]), True), StructField('bikes', LongType(), True), StructField('bikes_available_to_rent', LongType(), True), StructField('booked_bikes', LongType(), True), StructField('free_racks', LongType(), True), StructField('free_special_racks', LongType(), True), StructField('lat', DoubleType(), True), StructField('lng', DoubleType(), True), StructField('maintenance', BooleanType(), True), StructField('name', StringType(), True), StructField('number', LongType(), True), StructField('place_type', StringType(), True), StructField('rack_locks', BooleanType(), True), StructField('special_racks', LongType(), True), StructField('spot', BooleanType(), True), StructField('terminal_type', StringType(), True), StructField('uid', LongType(), True)]), True), True), StructField('refresh_rate', StringType(), True), StructField('return_to_official_only', BooleanType(), True), StructField('set_point_bikes', LongType(), True), StructField('uid', LongType(), True), StructField('website', StringType(), True), StructField('zoom', LongType(), True)]), True), True), StructField('country', StringType(), True), StructField('country_calling_code', StringType(), True), StructField('country_name', StringType(), True), StructField('currency', StringType(), True), StructField('domain', StringType(), True), StructField('email', StringType(), True), StructField('faq_url', StringType(), True), StructField('hotline', StringType(), True), StructField('language', StringType(), True), StructField('lat', DoubleType(), True), StructField('lng', DoubleType(), True), StructField('name', StringType(), True), StructField('no_registration', BooleanType(), True), StructField('policy', StringType(), True), StructField('pricing', StringType(), True), StructField('set_point_bikes', LongType(), True), StructField('show_bike_type_groups', BooleanType(), True), StructField('show_bike_types', BooleanType(), True), StructField('show_free_racks', BooleanType(), True), StructField('store_uri_android', StringType(), True), StructField('store_uri_ios', StringType(), True), StructField('system_operator_address', StringType(), True), StructField('terms', StringType(), True), StructField('timezone', StringType(), True), StructField('vat', StringType(), True), StructField('website', StringType(), True), StructField('zoom', LongType(), True)]), True), True)])
+# COMMAND ----------
 
+# MAGIC %run ./Utilities
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Get the JSON schema defined in the Utilities notebook
+
+# COMMAND ----------
+
+
+json_schema = get_json_schema()
 
 # COMMAND ----------
 
@@ -37,8 +49,9 @@ json_schema = StructType([StructField('countries', ArrayType(StructType([StructF
   table_properties = {"quality": "bronze"}
 )
 def raw_bubi_data():
-  return (spark.read
-    .format("json")
+  return (spark.readStream
+    .format("cloudFiles")
+    .option("cloudFiles.format", "json")
     .schema(json_schema)
     .load(volume_path)
     .withColumn("filename", F.col("_metadata.file_name"))
@@ -60,7 +73,7 @@ date_length = len("2024-03-14T01-30-02") # skip trailing Z
   table_properties = {"quality": "silver"}
 )
 def with_timestamp():
-  return (dlt.read("raw_bubi_data")
+  return (dlt.readStream("raw_bubi_data")
     .withColumn("date", F.substring("filename", 0, date_length))
     .withColumn("timestamp", F.to_timestamp("date", "yyyy-MM-dd'T'HH-mm-ss"))
     .select("countries", "timestamp")
@@ -92,7 +105,7 @@ windowSpec = (Window
   table_properties = {"quality": "silver"}
 )
 def time_deduped():
-  return (dlt.read("with_timestamp")
+  return (dlt.readStream("with_timestamp")
     .withColumn("date", F.col("timestamp").cast("date"))
     .withColumn("hour", F.hour("timestamp"))
     .withColumn("ten_minute", (F.minute("timestamp") / 10).cast("int"))
@@ -115,7 +128,7 @@ def time_deduped():
   table_properties = {"quality": "silver"}
 )
 def row_per_station():
-  return (dlt.read("time_deduped")
+  return (dlt.readStream("time_deduped")
     .withColumn("places", F.explode("places"))
     .filter(F.col("places.spot") == F.lit(True)) # This removes random bikes left around
     .filter(F.col("places.bike") == F.lit(False))
@@ -140,7 +153,7 @@ def row_per_station():
   table_properties = {"quality": "gold"}
 )
 def stations():
-  return (dlt.read("row_per_station")
+  return (dlt.readStream("row_per_station")
   .select("station_id", "name", "lat", "lng")
   .dropDuplicates()
   .withColumn("district", F.substring("name", 1, 2).cast("int"))
@@ -169,7 +182,7 @@ def dist(long_x, lat_x, long_y, lat_y):
   table_properties = {"quality": "gold"}
 )
 def station_distances():
-  return (dlt.read("stations")
+  return (dlt.readStream("stations")
     .drop("name", "district")
     .crossJoin(dlt.read("stations")
       .drop("name", "district")
@@ -189,7 +202,7 @@ def station_distances():
   table_properties = {"quality": "gold"}
 )
 def bikes_at_stations():
-  return (dlt.read("row_per_station")
+  return (dlt.readStream("row_per_station")
     .drop("name", "lat", "lng")
   )
 

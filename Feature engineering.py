@@ -136,6 +136,16 @@ display(gold_table.orderBy("station_id"))
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Write to feature store here! Add the ID already before writing! 
+# MAGIC
+# MAGIC What do we do with the label? 
+# MAGIC Füli, Petz Tomi, Litter Ádám, Endes Peti
+# MAGIC
+# MAGIC El kellene menteni a labelt is az indexel együtt, de az nem egy másik pipeline-ban kellene legyen, hogy itt tudjunk majd új adattal is dolgozni, amire még nincs label?
+
+# COMMAND ----------
+
 gold_table.write.mode("overwrite").saveAsTable("bence_toth.bubi_spark.gold_table")
 
 # COMMAND ----------
