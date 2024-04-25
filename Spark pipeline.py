@@ -58,12 +58,35 @@ json_schema = get_json_schema()
 
 # COMMAND ----------
 
-raw_bubi_data = (spark.read
-  .format("json")
+raw_bubi_data = (spark.readStream
+  .format("cloudFiles")
+  .option("cloudFiles.format", "json")
   .schema(json_schema)
   .load(volume_path)
-  .withColumn("filename", F.col("_metadata.file_name"))
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Let's write a function that transforms the data to a sensible format, as we will need that later for the batch reading as well.
+
+# COMMAND ----------
+
+from pyspark.sql import DataFrame
+
+def to_one_row_per_station_and_time(input: DataFrame) -> DataFrame:
+  return (input
+    .withColumn("filename", F.col("_metadata.file_name"))
+    .withColumn("data", F.element_at("countries", 1))
+    .withColumn("cities", F.col("data.cities"))
+    .withColumn("data", F.element_at("cities", 1))
+    .select("filename", "data")
+    .withColumn("places", F.col("data.places"))
+    .drop("data")
+    .withColumn("places", F.explode("places"))
+    .filter(F.col("places.spot") == F.lit(True)) # This removes random bikes left around
+    .filter(F.col("places.bike") == F.lit(False))
+  )
 
 # COMMAND ----------
 
@@ -77,15 +100,10 @@ raw_bubi_data = (spark.read
 date_length = len("2024-03-14T01-30-02") # skip trailing Z
 
 with_timestamp = (raw_bubi_data
+  .transform(to_one_row_per_station_and_time)
   .withColumn("date", F.substring("filename", 0, date_length))
-  .withColumn("timestamp", F.to_timestamp("date", "yyyy-MM-dd'T'HH-mm-ss"))
-  .select("countries", "timestamp")
-  .withColumn("data", F.element_at("countries", 1))
-  .withColumn("cities", F.col("data.cities"))
-  .withColumn("data", F.element_at("cities", 1))
-  .select("timestamp", "data")
-  .withColumn("places", F.col("data.places"))
-  .drop("data")
+  .withColumn("ts", F.to_timestamp("date", "yyyy-MM-dd'T'HH-mm-ss"))
+  .select("ts", "places")
 )
 
 
@@ -96,31 +114,22 @@ with_timestamp = (raw_bubi_data
 
 # COMMAND ----------
 
-from pyspark.sql.window import Window
-
-windowSpec = (Window
-  .partitionBy("date", "hour", "ten_minute")
-  .orderBy(F.col("timestamp"))
-)
-
 time_deduped = (with_timestamp
-  .withColumn("date", F.col("timestamp").cast("date"))
-  .withColumn("hour", F.hour("timestamp"))
-  .withColumn("ten_minute", (F.minute("timestamp") / 10).cast("int"))
-  .withColumn("measurement_in_ten_mins", F.dense_rank().over(windowSpec))
-  .filter(F.col("measurement_in_ten_mins") == 1)
-  .drop("measurement_in_ten_mins")
+  .withColumn("date", F.col("ts").cast("date"))
+  .withColumn("hour", F.hour("ts"))
+  .withColumn("ten_minute", (F.minute("ts") / 10).cast("int"))
   .withColumn("minute", F.col("ten_minute") * 10)
   .drop("ten_minute")
+  .groupBy("date", "hour", "minute")
+  .agg(
+    F.first("ts").alias("ts"),
+    F.first("places").alias("places")
+  )
   # truncate timestamp to minutes only
-  .withColumn("timestamp", F.date_trunc("minute", F.col("timestamp")))
+  .withColumn("ts", F.date_trunc("minute", F.col("ts")))
   # drop first run that is not at a ten-minute interval
-  .filter(F.col("timestamp") >= "2024-03-12T11:00:00.000+00:00")
+  .filter(F.col("ts") >= "2024-03-12T11:00:00.000+00:00")
 )
-
-# COMMAND ----------
-
-display(time_deduped.orderBy("timestamp"))
 
 # COMMAND ----------
 
@@ -130,17 +139,15 @@ display(time_deduped.orderBy("timestamp"))
 # COMMAND ----------
 
 row_per_station = (time_deduped
-  .withColumn("places", F.explode("places"))
-  .filter(F.col("places.spot") == F.lit(True)) # This removes random bikes left around
-  .filter(F.col("places.bike") == F.lit(False))
   .withColumn("bikes", F.col("places.bikes"))
   .withColumn("maintenance", F.col("places.maintenance"))
-  .withColumn("name", F.col("places.name"))
-  .withColumn("lat", F.col("places.lat"))
-  .withColumn("lng", F.col("places.lng"))
   .withColumn("station_id", F.col("places.number"))
   .drop("places")
 )
+
+# COMMAND ----------
+
+row_per_station.display()
 
 # COMMAND ----------
 
@@ -149,13 +156,23 @@ row_per_station = (time_deduped
 
 # COMMAND ----------
 
-stations = (row_per_station
+stations = (spark
+  .read
+  .format("json")
+  .load(volume_path)
+  .transform(to_one_row_per_station_and_time)
+  .withColumn("name", F.col("places.name"))
+  .withColumn("lat", F.col("places.lat"))
+  .withColumn("lng", F.col("places.lng"))
+  .withColumn("station_id", F.col("places.number"))
   .select("station_id", "name", "lat", "lng")
   .dropDuplicates()
   .withColumn("district", F.substring("name", 1, 2).cast("int"))
 )
 
-stations.cache().count()
+# COMMAND ----------
+
+stations.display()
 
 # COMMAND ----------
 
@@ -207,6 +224,8 @@ bikes_at_stations = (row_per_station
 
 # COMMAND ----------
 
+from pyspark.sql import Window
+
 N_closest_stations = 5
 
 distanceWindowSpec = (Window
@@ -222,10 +241,6 @@ closest_stations = (station_distances
   # dense_rank give ties, so we have to filter those to have exactly just five
   .withColumn("closest_stations", F.slice("closest_stations", 1, N_closest_stations))
 )
-
-# COMMAND ----------
-
-display(closest_stations)
 
 # COMMAND ----------
 
@@ -258,11 +273,23 @@ display(stations)
 
 # COMMAND ----------
 
-bikes_at_stations.write.mode("overwrite").saveAsTable(schema + ".bikes_at_stations")
+bikes_query = (bikes_at_stations
+  .writeStream
+  .outputMode("append")
+  .queryName("bikes_stream")
+  .trigger(availableNow=True)
+  .option("checkpointLocation", "/tmp/delta/events/_checkpoints/")
+  .toTable(schema + ".bikes_at_stations")
+)
 
 # COMMAND ----------
 
-stations.write.mode("overwrite").option("overwriteSchema", True).saveAsTable(schema + ".stations")
+# MAGIC %md
+# MAGIC These tables can be overwritten
+
+# COMMAND ----------
+
+stations.write.mode("overwrite").saveAsTable(schema + ".stations")
 
 # COMMAND ----------
 
