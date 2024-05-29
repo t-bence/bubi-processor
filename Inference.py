@@ -27,11 +27,20 @@ from databricks.feature_engineering import FeatureEngineeringClient
 fe = FeatureEngineeringClient()
 
 # Load the model
-model_uri = f"models:/{model_name}@delegating"
+model_uri = f"models:/{model_name}"
 
 # COMMAND ----------
 
 labels = spark.read.table(schema + ".label")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Here we load data directly from the feature table. This is not nice, could be improved to use Feature store, but it is not 100% clear how to do it in a streaming way.
+
+# COMMAND ----------
+
+features = spark.read.table(schema + ".features")
 
 # COMMAND ----------
 
@@ -41,19 +50,36 @@ labels = spark.read.table(schema + ".label")
 
 # COMMAND ----------
 
-result_df = fe.score_batch(
-    model_uri=model_uri,
-    df=labels,
-    result_type="int"
-)
+apply_return_schema = "station_id int, ts timestamp, prediction int"
+
+import pandas as pd
+import mlflow
+
+def apply_model(df_pandas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Applies model to data for a particular station, represented as a pandas DataFrame
+    """
+    model_path = model_uri + "/" + str(df_pandas["station_id"].iloc[0])
+
+    input_columns = df_pandas.drop(columns=["station_id", "ts"]).columns
+    X = df_pandas[input_columns]
+
+    model = mlflow.sklearn.load_model(model_path)
+    prediction = model.predict(X)
+
+    return_df = pd.DataFrame({
+        "station_id": df_pandas["station_id"],
+        "ts": df_pandas["ts"],
+        "prediction": prediction
+    })
+    return return_df
+
+prediction_df = features.groupby("device_id").applyInPandas(apply_model, schema=apply_return_schema)
+display(prediction_df)
 
 # COMMAND ----------
 
-result_df.show()
-
-# COMMAND ----------
-
-#result_df.write.saveAsTable(schema + ".predictions")
+#prediction_df.write.saveAsTable(schema + ".predictions")
 
 # COMMAND ----------
 
@@ -62,9 +88,9 @@ result_df.show()
 
 # COMMAND ----------
 
-most_current_timestamp = result_df.select(F.max("ts")).collect()[0][0]
+most_current_timestamp = prediction_df.select(F.max("ts")).collect()[0][0]
 
-current_predictions = (result_df
+current_predictions = (prediction_df
   .filter(F.col("ts") == most_current_timestamp)
   .display()
   #.write
