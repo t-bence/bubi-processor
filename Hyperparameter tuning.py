@@ -29,23 +29,7 @@ features = fe.read_table(name=schema + ".features")
 
 # COMMAND ----------
 
-hours_in_future = 4
-
-seconds = hours_in_future * 3600
-
-from pyspark.sql.window import Window
-
-windowSpec = (Window
-  .partitionBy("station_id")
-  .orderBy(F.unix_timestamp(F.col("ts")))
-  .rangeBetween(seconds - 10, seconds + 10)
-)
-
-label = (features
-  .select("station_id", "ts", "bikes")
-  .withColumn("label", F.mean("bikes").over(windowSpec))
-  .drop("bikes")
-)
+label = spark.read.table(schema + ".label")
 
 # COMMAND ----------
 
@@ -69,7 +53,6 @@ from databricks.feature_engineering.entities import FeatureLookup
 feature_lookups = [
     FeatureLookup(
         table_name="bence_toth.bubi_project.features",
-        #feature_name='account_creation_date',
         lookup_key="station_id",
         timestamp_lookup_key="ts"
     )
@@ -92,12 +75,6 @@ import mlflow
 mlflow.set_registry_uri("databricks-uc")
 
 
-from pyspark.ml.feature import VectorAssembler
-from pyspark.ml import Pipeline
-from pyspark.ml.regression import RandomForestRegressor
-from pyspark.ml.evaluation import RegressionEvaluator
-
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -110,7 +87,7 @@ selected_station_id = 2100
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Load data and do train-validation-test split. Convert all integer columns to double and simply drop any null values to avoid integer null problems
+# MAGIC Convert all integer columns to double and simply drop any null values to avoid integer null problems
 
 # COMMAND ----------
 
@@ -118,174 +95,130 @@ from pyspark.sql.types import IntegerType, LongType
 
 all_data = training_set.load_df().filter(F.col("label").isNotNull()).filter(F.col("station_id") == selected_station_id)
 
-integer_columns = [x.name for x in all_data.schema.fields if (x.dataType == IntegerType() or x.dataType == LongType())]
-
-for c in integer_columns:
-    all_data = all_data.withColumn(c, F.col(c).cast("double"))
-
 all_data = (all_data
     .na.drop(how="any")
     .drop("station_id")
+    .toPandas()
 )
 
-train_df, val_df, test_df = all_data.randomSplit([.6, .2, .2], seed=42)
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Train - test split
 
 # COMMAND ----------
 
-all_data.count()
+from sklearn.model_selection import train_test_split
 
-# COMMAND ----------
+print(f"We have {all_data.shape[0]} records in our source dataset")
 
-assembler_inputs = ["bikes", "weekday", "hour", "tenminute", "close_bikes_1", "close_bikes_2", "close_bikes_3", "close_bikes_4", "close_bikes_5"]
+# split target variable into it's own dataset
+target_col = "label"
+X_all = all_data.drop(labels=target_col, axis=1)
+y_all = all_data[target_col]
 
-vec_assembler = VectorAssembler(inputCols=assembler_inputs, outputCol="features")
-
-rf = RandomForestRegressor(labelCol="label", maxBins=40, seed=42)
-
-pipeline = Pipeline(stages=[vec_assembler, rf])
-
-regression_evaluator = RegressionEvaluator(predictionCol="prediction", labelCol="label", metricName="rmse")
-
-# COMMAND ----------
-
-def objective_function(params):    
-  # set the hyperparameters that we want to tune
-  max_depth = params["max_depth"]
-  num_trees = params["num_trees"]
-
-  with mlflow.start_run():
-    estimator = pipeline.copy({rf.maxDepth: max_depth, rf.numTrees: num_trees})
-    model = estimator.fit(train_df)
-
-    preds = model.transform(val_df)
-    rmse = regression_evaluator.setMetricName("rmse").evaluate(preds)
-    mlflow.log_metric("rmse", rmse)
-    r2 = regression_evaluator.setMetricName("r2").evaluate(preds)
-    mlflow.log_metric("r2", r2)
-
-  return rmse
+# test / train split
+X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, train_size=0.90, random_state=42)
+print(f"We have {X_train.shape[0]} records in our training dataset")
+print(f"We have {X_test.shape[0]} records in our test dataset")
 
 # COMMAND ----------
 
 from hyperopt import hp
 
-search_space = {
-  "max_depth": hp.quniform("max_depth", 4, 7, 1),
-  "num_trees": hp.quniform("num_trees", 10, 100, 1)
+param_space = {
+  'max_depth': hp.uniformint('dtree_max_depth_int', 5, 50),
+  'n_estimators': hp.uniformint('dtree_min_samples_split', 10, 150),
+  'min_samples_leaf': hp.uniformint('dtree_min_samples_leaf', 1, 20)
 }
 
 # COMMAND ----------
 
-from hyperopt import fmin, tpe, Trials, SparkTrials
-import numpy as np
+# MAGIC %md
+# MAGIC Define the optimization function
+
+# COMMAND ----------
+
+from math import sqrt
+
 import mlflow
-import mlflow.spark
-mlflow.pyspark.ml.autolog(log_models=False)
+import mlflow.data
+import mlflow.sklearn
 
-num_evals = 20
-trials = Trials()
-best_hyperparam = fmin(fn=objective_function, 
-                       space=search_space,
-                       algo=tpe.suggest, 
-                       max_evals=num_evals,
-                       trials=trials,
-                       rstate=np.random.default_rng(42))
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.model_selection import cross_validate
 
+from hyperopt import STATUS_OK
 
+def tuning_objective(params):
+  # start an MLFlow run
+  with mlflow.start_run(nested=True) as mlflow_run:
+    # Enable automatic logging of input samples, metrics, parameters, and models
+    mlflow.sklearn.autolog(
+        disable=False,
+        log_input_examples=True,
+        silent=True,
+        exclusive=False)
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Retrain model on train & validation dataset and evaluate on test dataset
-# MAGIC
-
-# COMMAND ----------
-
-best_hyperparam
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Compute test metrics
-
-# COMMAND ----------
-
-best_max_depth = best_hyperparam["max_depth"]
-best_num_trees = best_hyperparam["num_trees"]
-best_estimator = pipeline.copy({rf.maxDepth: best_max_depth, rf.numTrees: best_num_trees})
-
-combined_df = train_df.union(val_df) # Combine train & validation together
-
-
-
-# COMMAND ----------
-
-with mlflow.start_run():
-
-  model = best_estimator.fit(combined_df)
-
-  pred_df = model.transform(test_df)
-  rmse = regression_evaluator.setMetricName("rmse").evaluate(pred_df)
-  r2 = regression_evaluator.setMetricName("r2").evaluate(pred_df)
-
-  # Log param and metrics for the final model
-  mlflow.log_param("maxDepth", best_max_depth)
-  mlflow.log_param("numTrees", best_num_trees)
-  mlflow.log_metric("test_rmse", rmse)
-  mlflow.log_metric("test_r2", r2)
+    # set up our model estimator
+    gbr = GradientBoostingRegressor(**params)
     
-  fe.log_model(
-    model=model,
-    artifact_path="best_model",
-    flavor=mlflow.spark,
-    training_set=training_set
-#    registered_model_name="bence_toth.bubi.bubi_rf_model"
-  )
+    # cross-validated on the training set
+    validation_scores = ["r2", "neg_root_mean_squared_error"]
+    cv_results = cross_validate(gbr, 
+                                X_train, 
+                                y_train, 
+                                cv=5,
+                                scoring=validation_scores)
+    # log the average cross-validated results
+    cv_score_results = {}
+    for val_score in validation_scores:
+      cv_score_results[val_score] = cv_results[f'test_{val_score}'].mean()
+      mlflow.log_metric(f"cv_{val_score}", cv_score_results[val_score])
+
+    # fit the model on all training data
+    gbr_model = gbr.fit(X_train, y_train)
+
+    # evaluate the model on the test set
+    y_pred = gbr_model.predict(X_test)
+    r2_score(y_test, y_pred)
+    mean_squared_error(y_test, y_pred)
+    
+    # return the negative of our cross-validated F1 score as the loss
+    return {
+      "loss": -cv_score_results["neg_root_mean_squared_error"],
+      "status": STATUS_OK,
+      "run": mlflow_run
+    }
+
+# COMMAND ----------
+
+from hyperopt import SparkTrials, fmin, tpe
+
+# set the path for mlflow experiment
+mlflow.set_experiment(f"/Workspace/Users/bence.toth@datapao.com/Bubi-tuning")
+
+trials = SparkTrials(parallelism=4)
+with mlflow.start_run(run_name="Model Tuning with Hyperopt Demo") as parent_run:
+  fmin(tuning_objective,
+      space=param_space,
+      algo=tpe.suggest,
+      max_evals=20,  # Increase this when widening the hyperparameter search space.
+      trials=trials)
+
+best_result = trials.best_trial["result"]
+best_run = best_result["run"]
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Train one model for each station, package the model into a custom Pyfunc, then register it
-
-# COMMAND ----------
-
-model_name = "bence_toth.bubi.rf_model"
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC The data to train on
-
-# COMMAND ----------
-
-all_stations_data = (training_set
-  .load_df()
-  .filter(F.col("label").isNotNull())
-  .na.drop(how="any")
-)
-
-for c in integer_columns:
-  all_stations_data = all_stations_data.withColumn(c, F.col(c).cast("double"))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Train a model for each station
-
-# COMMAND ----------
-
-station_ids = [selected_station_id]
-
-station_to_model = dict()
-
-for station_id in station_ids:
-
-  station_data = all_stations_data.filter(F.col("station_id") == station_id).drop("station_id")
-
-  model = best_estimator.copy().fit(station_data)
-
-  station_to_model[str(station_id)] = model
-
+# MAGIC Best results were achieved with:
+# MAGIC [see experiment](https://adb-3679152566148441.1.azuredatabricks.net/ml/experiments/3561046141604344?o=3679152566148441&searchFilter=&orderByKey=metrics.%60cv_neg_root_mean_squared_error%60&orderByAsc=false&startTime=ALL&lifecycleFilter=Active&modelVersionFilter=All+Runs&datasetsFilter=W10%3D)
+# MAGIC
+# MAGIC - n_estimators = 140
+# MAGIC - max_depth = 34
+# MAGIC - min_samples_leaf = 14
 
 # COMMAND ----------
 
@@ -294,6 +227,7 @@ for station_id in station_ids:
 
 # COMMAND ----------
 
+"""
 class StationDelegatingModel(mlflow.pyfunc.PythonModel):
   def __init__(self, station_to_model_map):
     self.station_to_model_map = station_to_model_map
@@ -303,33 +237,4 @@ class StationDelegatingModel(mlflow.pyfunc.PythonModel):
     model = self.station_to_model_map[str(model_input)]
 
     return model.predict()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Log the custom model
-
-# COMMAND ----------
-
-from mlflow.models import ModelSignature, infer_signature
-from mlflow.types.schema import Schema, ColSpec
-
-# Option 1: Manually construct the signature object
-input_schema = Schema(
-    [
-        ColSpec("string", "station id")
-    ]
-)
-
-with mlflow.start_run() as run:
-
-  mlflow.pyfunc.log_model(
-    python_model=StationDelegatingModel(station_to_model),
-    artifact_path="rf_model",
-    signature=ModelSignature(inputs=input_schema, outputs=input_schema),
-    registered_model_name=model_name
-  )
-
-# COMMAND ----------
-
-
+"""
