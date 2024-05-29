@@ -12,6 +12,8 @@ schema = "bence_toth.bubi_project"
 
 volume_path = "/Volumes/bence_toth/bubi_project/bubi-scraper-v2-volume"
 
+checkpoints_folder = "/tmp/bubi/checkpoints/"
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -35,6 +37,10 @@ volume_path = "/Volumes/bence_toth/bubi_project/bubi-scraper-v2-volume"
 # MAGIC %md
 # MAGIC # jsons_bronze
 # MAGIC This contains the raw jsons and the file names
+# MAGIC
+# MAGIC For notifications to work, I would need to set up the following parameters: https://docs.databricks.com/en/ingestion/auto-loader/options.html#azure-specific-options
+# MAGIC
+# MAGIC I'm skipping that for the sake of simplicity.
 
 # COMMAND ----------
 
@@ -42,6 +48,7 @@ jsons_bronze = (spark
   .readStream
   .format("cloudFiles")
   .option("cloudFiles.format", "json")
+  #.option("cloudFiles.useNotifications", "true")
   .schema(get_json_schema())
   .load(volume_path)
   .withColumn("filename", F.col("_metadata.file_name"))
@@ -59,7 +66,7 @@ jsons_bronze = (spark
   .outputMode("append")
   .queryName("json_stream")
   .trigger(availableNow=True)
-  .option("checkpointLocation", "/tmp/delta/events/_checkpoints/")
+  .option("checkpointLocation", checkpoints_folder + "jsons_bronze")
   .toTable("jsons_bronze")
 )
 
@@ -84,28 +91,37 @@ snapshots_silver = (jsons_bronze
   .withColumn("places", F.col("data.places"))
   .drop("data")
   .withColumn("places", F.explode("places"))
-  .filter(F.col("places.spot") == F.lit(True)) # This removes random bikes left around
+  # next 2 lines remove random bikes left around 
+  .filter(F.col("places.spot") == F.lit(True)) 
   .filter(F.col("places.bike") == F.lit(False))
-  # deduplicate for every ten minute interval
   .select("ts", "places")
   # truncate timestamp to minutes only
   .withColumn("ts", F.date_trunc("minute", F.col("ts")))
-  # drop first run that is not at a ten-minute interval
-  .filter(F.col("ts") >= "2024-03-12T11:00:00.000+00:00")
+  # drop first few runs that are sometimes not at a ten-minute interval
+  .filter(F.col("ts") >= "2024-03-12T12:00:00.000+00:00")
   # extract the useful columns
+  .withColumn("station_id", F.col("places.number"))
   .withColumn("bikes", F.col("places.bikes"))
   .withColumn("maintenance", F.col("places.maintenance"))
   .withColumn("station_name", F.col("places.name"))
   .withColumn("lat", F.col("places.lat"))
   .withColumn("lng", F.col("places.lng"))
-  .withColumn("station_id", F.col("places.number"))
   .drop("places")
-  .withColumn("date", F.col("ts").cast("date"))
-  .withColumn("hour", F.hour("ts"))
-  .withColumn("ten_minute", (F.minute("ts") / 10).cast("int"))
-  .dropDuplicates(["station_id", "date", "hour", "ten_minute"])
-  .drop("date", "hour", "ten_minute")
+  # fix timestamps to correspond to always XX:10:00 or XX:20:00 or so
+  .transform(timestamp_to_ten_minutes, "ts")
+  .dropDuplicates(["ts", "station_id"])
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Drop table and checkpoints -- only in development!
+
+# COMMAND ----------
+
+# ONLY IN DEVELOPMENT
+#spark.sql("DROP TABLE IF EXISTS snapshots_silver")
+#dbutils.fs.rm("dbfs:/tmp/bubi/checkpoints/snapshots_silver", True)
 
 # COMMAND ----------
 
@@ -119,7 +135,7 @@ snapshots_query = (snapshots_silver
   .outputMode("append")
   .queryName("snapshot_stream")
   .trigger(availableNow=True)
-  .option("checkpointLocation", "/tmp/checkpoints")
+  .option("checkpointLocation", checkpoints_folder + "snapshots_silver")
   .toTable("snapshots_silver")
 )
 
@@ -128,16 +144,24 @@ snapshots_query = (snapshots_silver
 # MAGIC %md
 # MAGIC #stations_silver table
 # MAGIC
-# MAGIC This should contain the individual stations with the closest five from them
+# MAGIC This should contain the individual stations with the closest five from them. But for now, let's only save the station IDs and positions.
+# MAGIC
+# MAGIC This is because it can be done with a streaming query.
 
 # COMMAND ----------
 
-stations = (spark
-  .read
+stations_query = (spark
+  .readStream
   .table("snapshots_silver")
   .select("station_id", "station_name", "lat", "lng")
   .dropDuplicates()
   .withColumn("district", F.substring("station_name", 1, 2).cast("int"))
+  .writeStream
+  .outputMode("append")
+  .queryName("stations_stream")
+  .trigger(availableNow=True)
+  .option("checkpointLocation", checkpoints_folder + "stations_silver")
+  .toTable("stations_silver")
 )
 
 # COMMAND ----------
@@ -165,6 +189,8 @@ distanceWindowSpec = (Window
   .orderBy(F.col("distance_meters"))
 )
 
+stations = spark.read.table("stations_silver")
+
 closest_stations = (stations
   .drop("station_name", "district")
   .crossJoin(stations
@@ -173,7 +199,6 @@ closest_stations = (stations
     .withColumnRenamed("lat", "other_lat")
     .withColumnRenamed("lng", "other_lng")
   )
-  #.filter(F.col("station_id") < F.col("other_station_id"))
   .filter(F.col("station_id") != F.col("other_station_id"))
   .withColumn("distance_meters",
     dist(F.col("lng"), F.col("lat"), F.col("other_lng"), F.col("other_lat")).cast("int"))
@@ -188,21 +213,14 @@ closest_stations = (stations
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC Join closest stations onto stations and write to a batch table
-
-# COMMAND ----------
-
-stations.display()
-
-# COMMAND ----------
-
-(stations
+stations_with_closest = (stations
   .join(closest_stations, "station_id")
-  .write
-  .mode("overwrite")
-  .saveAsTable("stations_silver")
+  .select("station_id", "closest_stations")
 )
+
+# COMMAND ----------
+
+stations_with_closest.display()
 
 # COMMAND ----------
 
@@ -217,18 +235,8 @@ snapshots = (spark
   .withWatermark("ts", "10 seconds")
 )
 
-from pyspark.sql.window import Window
-
-seconds_in_hours = 3600
-
-windowSpec = (Window
-  .partitionBy("station_id")
-  .orderBy(F.unix_timestamp(F.col("timestamp")))
-  .rangeBetween(4 * seconds_in_hours - 10, 4 * seconds_in_hours + 10) # data four hours from now
-)
-
 gold = (snapshots
-  .join(spark.read.table("stations_silver").select("station_id", "closest_stations"), "station_id", "left")
+  .join(stations_with_closest, "station_id", "left")
   .withColumn("close_station", F.explode("closest_stations"))
   .drop("closest_stations")
   .join(snapshots
@@ -244,15 +252,19 @@ gold = (snapshots
   .withColumn("weekday", F.dayofweek("ts"))
   .withColumn("hour", F.hour("ts"))
   .withColumn("tenminute", F.minute("ts") / 10)
-  #.withColumn("future_bikes", F.mean("bikes").over(windowSpec))
   .withColumn("close_bikes_1", F.element_at("close_bikes", 1))
   .withColumn("close_bikes_2", F.element_at("close_bikes", 2))
   .withColumn("close_bikes_3", F.element_at("close_bikes", 3))
   .withColumn("close_bikes_4", F.element_at("close_bikes", 4))
   .withColumn("close_bikes_5", F.element_at("close_bikes", 5))
   .drop("close_bikes")
-  #.filter(F.col("future_bikes").isNotNull())
 )
+
+# COMMAND ----------
+
+# ONLY IN DEVELOPMENT
+#spark.sql("DROP TABLE IF EXISTS gold")
+#dbutils.fs.rm("dbfs:/tmp/bubi/checkpoints/gold", True)
 
 # COMMAND ----------
 
@@ -261,9 +273,14 @@ gold = (snapshots
   .outputMode("append")
   .queryName("gold_stream")
   .trigger(availableNow=True)
-  .option("checkpointLocation", "/tmp/bubi/checkpoints/gold")
+  .option("checkpointLocation", checkpoints_folder + "gold")
   .toTable("gold")
 )
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM gold WHERE close_bikes_5 IS NULL
 
 # COMMAND ----------
 
@@ -278,6 +295,13 @@ fe = FeatureEngineeringClient()
 
 feature_table_name = schema + ".features"
 
+# COMMAND ----------
+
+# Drop table
+#fe.drop_table(name=feature_table_name)
+
+# COMMAND ----------
+
 fe.create_table(name=feature_table_name,
   description="Features for Bubi learning",
   schema=gold.schema,
@@ -290,10 +314,35 @@ fe.create_table(name=feature_table_name,
 fe.write_table(name=feature_table_name,
   mode="merge",
   df=spark.read.table("gold"),
-  #checkpoint_location="/tmp/bubi/checkpoints/features",
+  #checkpoint_location="/tmp/bubi/checkpoints/features", # this cannot be a streaming write
   trigger={"availableNow": True}
 )
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Label creation
+# MAGIC
+# MAGIC Label: number of bikes at the same station, four hours in the future based on the ts timestamp
 
+# COMMAND ----------
+
+hours_in_future = 4
+
+seconds = hours_in_future * 3600
+
+from pyspark.sql.window import Window
+
+windowSpec = (Window
+  .partitionBy("station_id")
+  .orderBy(F.unix_timestamp(F.col("ts")))
+  .rangeBetween(seconds - 10, seconds + 10)
+)
+
+label = (spark.read.table("gold")
+  .select("station_id", "ts", "bikes")
+  .withColumn("label", F.mean("bikes").over(windowSpec))
+  .drop("bikes")
+)
+
+label.write.mode("overwrite").saveAsTable(schema + ".label")
