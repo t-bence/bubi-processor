@@ -3,6 +3,11 @@ from pyspark.sql.types import StructType, StructField, ArrayType, BooleanType, L
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Input JSON schema
+
+# COMMAND ----------
+
 
 
 def get_json_schema():
@@ -12,6 +17,8 @@ def get_json_schema():
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC # Timestamp rounding
+# MAGIC
 # MAGIC Timestamp rounding function -- rounds the timestamp to the nearest 10 minutes, in a floor fashion. E.g.:
 # MAGIC
 # MAGIC `2024-03-12 12:11:50 -> 2024-03-12 12:10:00`
@@ -58,6 +65,23 @@ assert timestamps[2] == datetime(2024, 4, 25, 13, 30, 0)
 assert timestamps[3] == datetime(2024, 4, 25, 14, 0, 0)
 assert timestamps[4] == datetime(2024, 4, 25, 15, 0, 0)
 print("Tests passed")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Get latest model version from UC
+
+# COMMAND ----------
+
+def get_latest_model_version(model_name: str):
+  """Helper function to get latest model version"""
+  import mlflow
+  mlflow.set_registry_uri("databricks-uc")
+
+  client = mlflow.MlflowClient()
+
+  model_version_infos = client.search_model_versions(f"name = '{model_name}'")
+  return max([model_version_info.version for model_version_info in model_version_infos])
 
 # COMMAND ----------
 
