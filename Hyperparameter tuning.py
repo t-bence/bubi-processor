@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Construct label
+# MAGIC # Hyperparameter tuning
 
 # COMMAND ----------
 
