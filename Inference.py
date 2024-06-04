@@ -26,9 +26,6 @@ from databricks.feature_engineering import FeatureEngineeringClient
 # Feature table definition
 fe = FeatureEngineeringClient()
 
-# Load the model
-model_uri = f"models:/{model_name}"
-
 # COMMAND ----------
 
 labels = spark.read.table(schema + ".label")
@@ -54,12 +51,19 @@ apply_return_schema = "station_id int, ts timestamp, prediction int"
 
 import pandas as pd
 import mlflow
+mlflow.set_registry_uri("databricks-uc")
 
 def apply_model(df_pandas: pd.DataFrame) -> pd.DataFrame:
     """
     Applies model to data for a particular station, represented as a pandas DataFrame
     """
-    model_path = model_uri + "/" + str(df_pandas["station_id"].iloc[0])
+    mlflow.set_registry_uri("databricks-uc")
+
+    df_pandas = df_pandas.dropna(axis="index")
+
+    station_id = df_pandas["station_id"].iloc[0]
+
+    model_path = f"models:/{model_name}_{station_id}@Champion"
 
     input_columns = df_pandas.drop(columns=["station_id", "ts"]).columns
     X = df_pandas[input_columns]
@@ -74,12 +78,16 @@ def apply_model(df_pandas: pd.DataFrame) -> pd.DataFrame:
     })
     return return_df
 
-prediction_df = features.groupby("device_id").applyInPandas(apply_model, schema=apply_return_schema)
+prediction_df = (features
+  .groupby("station_id")
+  .applyInPandas(apply_model, schema=apply_return_schema)
+  .withColumn("prediction_valid", F.col("ts") + F.make_interval(hours=F.lit(4))) # add four hours for when the label is predicted for
+)
 display(prediction_df)
 
 # COMMAND ----------
 
-#prediction_df.write.saveAsTable(schema + ".predictions")
+prediction_df.write.saveAsTable(schema + ".predictions")
 
 # COMMAND ----------
 
@@ -92,8 +100,11 @@ most_current_timestamp = prediction_df.select(F.max("ts")).collect()[0][0]
 
 current_predictions = (prediction_df
   .filter(F.col("ts") == most_current_timestamp)
-  .display()
-  #.write
-  #.mode("overwrite")
-  #.saveAsTable(schema + ".current_predictions")
+  .write
+  .mode("overwrite")
+  .saveAsTable(schema + ".current_predictions")
 )
+
+# COMMAND ----------
+
+

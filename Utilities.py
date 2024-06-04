@@ -65,24 +65,3 @@ assert timestamps[2] == datetime(2024, 4, 25, 13, 30, 0)
 assert timestamps[3] == datetime(2024, 4, 25, 14, 0, 0)
 assert timestamps[4] == datetime(2024, 4, 25, 15, 0, 0)
 print("Tests passed")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # Get latest model version from UC
-
-# COMMAND ----------
-
-def get_latest_model_version(model_name: str):
-  """Helper function to get latest model version"""
-  import mlflow
-  mlflow.set_registry_uri("databricks-uc")
-
-  client = mlflow.MlflowClient()
-
-  model_version_infos = client.search_model_versions(f"name = '{model_name}'")
-  return max([model_version_info.version for model_version_info in model_version_infos])
-
-# COMMAND ----------
-
-
