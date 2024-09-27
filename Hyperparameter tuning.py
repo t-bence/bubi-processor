@@ -1,6 +1,8 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Hyperparameter tuning
+# MAGIC
+# MAGIC This notebook contains an error: there should be no CV for hyperparameter tuning as it can lead to data leakage!
 
 # COMMAND ----------
 
